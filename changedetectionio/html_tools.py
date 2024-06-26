@@ -3,8 +3,6 @@ from bs4 import BeautifulSoup
 from inscriptis import get_text
 from jsonpath_ng.ext import parse
 from typing import List
-from inscriptis.css_profiles import CSS_PROFILES, HtmlElement
-from inscriptis.html_properties import Display
 from inscriptis.model.config import ParserConfig
 from xml.sax.saxutils import escape as xml_escape
 import json
@@ -169,14 +167,14 @@ def xpath1_filter(xpath_filter, html_content, append_pretty_line_formatting=Fals
         # And where the matched result doesn't include something that will cause Inscriptis to add a newline
         # (This way each 'match' reliably has a new-line in the diff)
         # Divs are converted to 4 whitespaces by inscriptis
-        if append_pretty_line_formatting and len(html_block) and (not hasattr( element, 'tag' ) or not element.tag in (['br', 'hr', 'div', 'p'])):
+        if append_pretty_line_formatting and len(html_block) and (not hasattr(element, 'tag') or not element.tag in (['br', 'hr', 'div', 'p'])):
             html_block += TEXT_FILTER_LIST_LINE_SUFFIX
 
-        if type(element) == etree._ElementStringResult:
-            html_block += str(element)
-        elif type(element) == etree._ElementUnicodeResult:
-            html_block += str(element)
+        # Some kind of text, UTF-8 or other
+        if isinstance(element, (str, bytes)):
+            html_block += element
         else:
+            # Return the HTML which will get parsed as text
             html_block += etree.tostring(element, pretty_print=True).decode('utf-8')
 
     return html_block
@@ -196,12 +194,12 @@ def extract_element(find='title', html_content=''):
 
 #
 def _parse_json(json_data, json_filter):
-    if 'json:' in json_filter:
+    if json_filter.startswith("json:"):
         jsonpath_expression = parse(json_filter.replace('json:', ''))
         match = jsonpath_expression.find(json_data)
         return _get_stripped_text_from_json_match(match)
 
-    if 'jq:' in json_filter:
+    if json_filter.startswith("jq:") or json_filter.startswith("jqraw:"):
 
         try:
             import jq
@@ -209,10 +207,15 @@ def _parse_json(json_data, json_filter):
             # `jq` requires full compilation in windows and so isn't generally available
             raise Exception("jq not support not found")
 
-        jq_expression = jq.compile(json_filter.replace('jq:', ''))
-        match = jq_expression.input(json_data).all()
+        if json_filter.startswith("jq:"):
+            jq_expression = jq.compile(json_filter.removeprefix("jq:"))
+            match = jq_expression.input(json_data).all()
+            return _get_stripped_text_from_json_match(match)
 
-        return _get_stripped_text_from_json_match(match)
+        if json_filter.startswith("jqraw:"):
+            jq_expression = jq.compile(json_filter.removeprefix("jqraw:"))
+            match = jq_expression.input(json_data).all()
+            return '\n'.join(str(item) for item in match)
 
 def _get_stripped_text_from_json_match(match):
     s = []

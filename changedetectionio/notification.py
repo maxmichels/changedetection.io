@@ -1,6 +1,5 @@
 import apprise
 import time
-from jinja2 import Environment, BaseLoader
 from apprise import NotifyFormat
 import json
 from loguru import logger
@@ -49,7 +48,7 @@ from apprise.decorators import notify
 def apprise_custom_api_call_wrapper(body, title, notify_type, *args, **kwargs):
     import requests
     from apprise.utils import parse_url as apprise_parse_url
-    from apprise.URLBase import URLBase
+    from apprise import URLBase
 
     url = kwargs['meta'].get('url')
 
@@ -116,13 +115,13 @@ def apprise_custom_api_call_wrapper(body, title, notify_type, *args, **kwargs):
 
 def process_notification(n_object, datastore):
 
+    from .safe_jinja import render as jinja_render
+    now = time.time()
+    if n_object.get('notification_timestamp'):
+        logger.trace(f"Time since queued {now-n_object['notification_timestamp']:.3f}s")
     # Insert variables into the notification content
     notification_parameters = create_notification_parameters(n_object, datastore)
 
-    # Get the notification body from datastore
-    jinja2_env = Environment(loader=BaseLoader)
-    n_body = jinja2_env.from_string(n_object.get('notification_body', '')).render(**notification_parameters)
-    n_title = jinja2_env.from_string(n_object.get('notification_title', '')).render(**notification_parameters)
     n_format = valid_notification_formats.get(
         n_object.get('notification_format', default_notification_format),
         valid_notification_formats[default_notification_format],
@@ -132,6 +131,8 @@ def process_notification(n_object, datastore):
     if n_format == default_notification_format_for_watch and datastore.data['settings']['application'].get('notification_format') != default_notification_format_for_watch:
         # Initially text or whatever
         n_format = datastore.data['settings']['application'].get('notification_format', valid_notification_formats[default_notification_format])
+
+    logger.trace(f"Complete notification body including Jinja and placeholders calculated in  {time.time() - now:.3f}s")
 
     # https://github.com/caronc/apprise/wiki/Development_LogCapture
     # Anything higher than or equal to WARNING (which covers things like Connection errors)
@@ -146,9 +147,18 @@ def process_notification(n_object, datastore):
 
     with apprise.LogCapture(level=apprise.logging.DEBUG) as logs:
         for url in n_object['notification_urls']:
+
+            # Get the notification body from datastore
+            n_body = jinja_render(template_str=n_object.get('notification_body', ''), **notification_parameters)
+            n_title = jinja_render(template_str=n_object.get('notification_title', ''), **notification_parameters)
+
             url = url.strip()
+            if not url:
+                logger.warning(f"Process Notification: skipping empty notification URL.")
+                continue
+
             logger.info(">> Process Notification: AppRise notifying {}".format(url))
-            url = jinja2_env.from_string(url).render(**notification_parameters)
+            url = jinja_render(template_str=url, **notification_parameters)
 
             # Re 323 - Limit discord length to their 2000 char limit total or it wont send.
             # Because different notifications may require different pre-processing, run each sequentially :(

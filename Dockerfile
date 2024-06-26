@@ -1,5 +1,11 @@
 # pip dependencies install stage
-FROM python:3.11-slim-bookworm as builder
+
+# @NOTE! I would love to move to 3.11 but it breaks the async handler in changedetectionio/content_fetchers/puppeteer.py
+#        If you know how to fix it, please do! and test it for both 3.10 and 3.11
+
+ARG PYTHON_VERSION=3.11
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
 
 # See `cryptography` pin comment in requirements.txt
 ARG CRYPTOGRAPHY_DONT_BUILD_RUST=1
@@ -20,16 +26,17 @@ WORKDIR /install
 
 COPY requirements.txt /requirements.txt
 
-RUN pip install --target=/dependencies -r /requirements.txt
+# --extra-index-url https://www.piwheels.org/simple  is for cryptography module to be prebuilt (or rustc etc needs to be installed)
+RUN pip install --extra-index-url https://www.piwheels.org/simple  --target=/dependencies -r /requirements.txt
 
 # Playwright is an alternative to Selenium
 # Excluded this package from requirements.txt to prevent arm/v6 and arm/v7 builds from failing
 # https://github.com/dgtlmoon/changedetection.io/pull/1067 also musl/alpine (not supported)
-RUN pip install --target=/dependencies playwright~=1.40 \
+RUN pip install --target=/dependencies playwright~=1.41.2 \
     || echo "WARN: Failed to install Playwright. The application can still run, but the Playwright option will be disabled."
 
 # Final image stage
-FROM python:3.11-slim-bookworm
+FROM python:${PYTHON_VERSION}-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libxslt1.1 \

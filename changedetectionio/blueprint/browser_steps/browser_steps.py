@@ -6,6 +6,9 @@ import re
 from random import randint
 from loguru import logger
 
+from changedetectionio.content_fetchers.base import manage_user_agent
+from changedetectionio.safe_jinja import render as jinja_render
+
 # Two flags, tell the JS which of the "Selector" or "Value" field should be enabled in the front end
 # 0- off, 1- on
 browser_step_ui_config = {'Choose one': '0 0',
@@ -46,6 +49,10 @@ browser_step_ui_config = {'Choose one': '0 0',
 # ONLY Works in Playwright because we need the fullscreen screenshot
 class steppable_browser_interface():
     page = None
+    start_url = None
+
+    def __init__(self, start_url):
+        self.start_url = start_url
 
     # Convert and perform "Click Button" for example
     def call_action(self, action_name, selector=None, optional_value=None):
@@ -62,14 +69,12 @@ class steppable_browser_interface():
         action_handler = getattr(self, "action_" + call_action_name)
 
         # Support for Jinja2 variables in the value and selector
-        from jinja2 import Environment
-        jinja2_env = Environment(extensions=['jinja2_time.TimeExtension'])
 
         if selector and ('{%' in selector or '{{' in selector):
-            selector = str(jinja2_env.from_string(selector).render())
+            selector = jinja_render(template_str=selector)
 
         if optional_value and ('{%' in optional_value or '{{' in optional_value):
-            optional_value = str(jinja2_env.from_string(optional_value).render())
+            optional_value = jinja_render(template_str=optional_value)
 
         action_handler(selector, optional_value)
         self.page.wait_for_timeout(1.5 * 1000)
@@ -85,6 +90,10 @@ class steppable_browser_interface():
         #await page.waitForTimeout(extra_wait_ms);
         logger.debug(f"Time to goto URL {time.time()-now:.2f}s")
         return response
+
+    # Incase they request to go back to the start
+    def action_goto_site(self, selector=None, value=None):
+        return self.action_goto_url(value=self.start_url)
 
     def action_click_element_containing_text(self, selector=None, value=''):
         if not len(value.strip()):
@@ -169,7 +178,7 @@ class steppable_browser_interface():
         self.page.locator(selector, timeout=1000).uncheck(timeout=1000)
 
 
-# Responsible for maintaining a live 'context' with browserless
+# Responsible for maintaining a live 'context' with the chrome CDP
 # @todo - how long do contexts live for anyway?
 class browsersteps_live_ui(steppable_browser_interface):
     context = None
@@ -178,6 +187,7 @@ class browsersteps_live_ui(steppable_browser_interface):
     stale = False
     # bump and kill this if idle after X sec
     age_start = 0
+    headers = {}
 
     # use a special driver, maybe locally etc
     command_executor = os.getenv(
@@ -192,9 +202,11 @@ class browsersteps_live_ui(steppable_browser_interface):
 
     browser_type = os.getenv("PLAYWRIGHT_BROWSER_TYPE", 'chromium').strip('"')
 
-    def __init__(self, playwright_browser, proxy=None):
+    def __init__(self, playwright_browser, proxy=None, headers=None, start_url=None):
+        self.headers = headers or {}
         self.age_start = time.time()
         self.playwright_browser = playwright_browser
+        self.start_url = start_url
         if self.context is None:
             self.connect(proxy=proxy)
 
@@ -206,15 +218,16 @@ class browsersteps_live_ui(steppable_browser_interface):
 
         # @todo handle multiple contexts, bind a unique id from the browser on each req?
         self.context = self.playwright_browser.new_context(
-            # @todo
-            #                user_agent=request_headers['User-Agent'] if request_headers.get('User-Agent') else 'Mozilla/5.0',
-            #               proxy=self.proxy,
-            # This is needed to enable JavaScript execution on GitHub and others
-            bypass_csp=True,
-            # Should never be needed
-            accept_downloads=False,
-            proxy=proxy
+            accept_downloads=False,  # Should never be needed
+            bypass_csp=True,  # This is needed to enable JavaScript execution on GitHub and others
+            extra_http_headers=self.headers,
+            ignore_https_errors=True,
+            proxy=proxy,
+            service_workers=os.getenv('PLAYWRIGHT_SERVICE_WORKERS', 'allow'),
+            # Should be `allow` or `block` - sites like YouTube can transmit large amounts of data via Service Workers
+            user_agent=manage_user_agent(headers=self.headers),
         )
+
 
         self.page = self.context.new_page()
 
@@ -242,8 +255,8 @@ class browsersteps_live_ui(steppable_browser_interface):
 
     def get_current_state(self):
         """Return the screenshot and interactive elements mapping, generally always called after action_()"""
-        from pkg_resources import resource_string
-        xpath_element_js = resource_string(__name__, "../../res/xpath_element_scraper.js").decode('utf-8')
+        import importlib.resources
+        xpath_element_js = importlib.resources.read_text("changedetectionio.content_fetchers.res", "xpath_element_scraper.js")
         now = time.time()
         self.page.wait_for_timeout(1 * 1000)
 
@@ -274,14 +287,12 @@ class browsersteps_live_ui(steppable_browser_interface):
         :param current_include_filters:
         :return:
         """
-
+        import importlib.resources
         self.page.evaluate("var include_filters=''")
-        from pkg_resources import resource_string
-        # The code that scrapes elements and makes a list of elements/size/position to click on in the VisualSelector
-        xpath_element_js = resource_string(__name__, "../../res/xpath_element_scraper.js").decode('utf-8')
-        from changedetectionio.content_fetcher import visualselector_xpath_selectors
+        xpath_element_js = importlib.resources.read_text("changedetectionio.content_fetchers.res", "xpath_element_scraper.js")
+        from changedetectionio.content_fetchers import visualselector_xpath_selectors
         xpath_element_js = xpath_element_js.replace('%ELEMENTS%', visualselector_xpath_selectors)
         xpath_data = self.page.evaluate("async () => {" + xpath_element_js + "}")
-        screenshot = self.page.screenshot(type='jpeg', full_page=True, quality=int(os.getenv("PLAYWRIGHT_SCREENSHOT_QUALITY", 72)))
+        screenshot = self.page.screenshot(type='jpeg', full_page=True, quality=int(os.getenv("SCREENSHOT_QUALITY", 72)))
 
         return (screenshot, xpath_data)

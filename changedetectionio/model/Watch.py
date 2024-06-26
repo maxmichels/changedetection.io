@@ -1,4 +1,6 @@
-from distutils.util import strtobool
+from changedetectionio.strtobool import strtobool
+from changedetectionio.safe_jinja import render as jinja_render
+
 import os
 import re
 import time
@@ -10,7 +12,7 @@ from loguru import logger
 # file:// is further checked by ALLOW_FILE_URI
 SAFE_PROTOCOL_REGEX='^(http|https|ftp|file):'
 
-minimum_seconds_recheck_time = int(os.getenv('MINIMUM_SECONDS_RECHECK_TIME', 60))
+minimum_seconds_recheck_time = int(os.getenv('MINIMUM_SECONDS_RECHECK_TIME', 3))
 mtable = {'seconds': 1, 'minutes': 60, 'hours': 3600, 'days': 86400, 'weeks': 86400 * 7}
 
 from changedetectionio.notification import (
@@ -45,6 +47,7 @@ base_config = {
     'last_error': False,
     'last_viewed': 0,  # history key value of the last viewed via the [diff] link
     'method': 'GET',
+    'notification_alert_count': 0,
     # Custom notification content
     'notification_body': None,
     'notification_format': default_notification_format_for_watch,
@@ -56,6 +59,8 @@ base_config = {
     'previous_md5': False,
     'previous_md5_before_filters': False,  # Used for skipping changedetection entirely
     'proxy': None,  # Preferred proxy connection
+    'remote_server_reply': None, # From 'server' reply header
+    'sort_text_alphabetically': False,
     'subtractive_selectors': [],
     'tag': '', # Old system of text name for a tag, to be removed
     'tags': [], # list of UUIDs to App.Tags
@@ -64,6 +69,7 @@ base_config = {
     # Requires setting to None on submit if it's the same as the default
     # Should be all None by default, so we use the system default in this case.
     'time_between_check': {'weeks': None, 'days': None, 'hours': None, 'minutes': None, 'seconds': None},
+    'time_between_check_use_default': True,
     'title': None,
     'trigger_text': [],  # List of text or regex to wait for until a change is detected
     'url': '',
@@ -134,12 +140,11 @@ class model(dict):
 
         ready_url = url
         if '{%' in url or '{{' in url:
-            from jinja2 import Environment
             # Jinja2 available in URLs along with https://pypi.org/project/jinja2-time/
-            jinja2_env = Environment(extensions=['jinja2_time.TimeExtension'])
             try:
-                ready_url = str(jinja2_env.from_string(url).render())
+                ready_url = jinja_render(template_str=url)
             except Exception as e:
+                logger.critical(f"Invalid URL template for: '{url}' - {str(e)}")
                 from flask import (
                     flash, Markup, url_for
                 )
@@ -246,10 +251,10 @@ class model(dict):
     @property
     def has_browser_steps(self):
         has_browser_steps = self.get('browser_steps') and list(filter(
-                lambda s: (s['operation'] and len(s['operation']) and s['operation'] != 'Choose one' and s['operation'] != 'Goto site'),
-                self.get('browser_steps')))
+            lambda s: (s['operation'] and len(s['operation']) and s['operation'] != 'Choose one' and s['operation'] != 'Goto site'),
+            self.get('browser_steps')))
 
-        return  has_browser_steps
+        return has_browser_steps
 
     # Returns the newest key, but if theres only 1 record, then it's counted as not being new, so return 0.
     @property
@@ -323,12 +328,9 @@ class model(dict):
     def save_history_text(self, contents, timestamp, snapshot_id):
         import brotli
 
-        self.ensure_data_dir_exists()
+        logger.trace(f"{self.get('uuid')} - Updating history.txt with timestamp {timestamp}")
 
-        # Small hack so that we sleep just enough to allow 1 second  between history snapshots
-        # this is because history.txt indexes/keys snapshots by epoch seconds and we dont want dupe keys
-        if self.__newest_history_key and int(timestamp) == int(self.__newest_history_key):
-            time.sleep(timestamp - self.__newest_history_key)
+        self.ensure_data_dir_exists()
 
         threshold = int(os.getenv('SNAPSHOT_BROTLI_COMPRESSION_THRESHOLD', 1024))
         skip_brotli = strtobool(os.getenv('DISABLE_BROTLI_TEXT_SNAPSHOT', 'False'))
@@ -359,6 +361,7 @@ class model(dict):
         # @todo bump static cache of the last timestamp so we dont need to examine the file to set a proper ''viewed'' status
         return snapshot_fname
 
+    @property
     @property
     def has_empty_checktime(self):
         # using all() + dictionary comprehension
@@ -520,8 +523,42 @@ class model(dict):
         # None is set
         return False
 
+    def save_error_text(self, contents):
+        self.ensure_data_dir_exists()
+        target_path = os.path.join(self.watch_data_dir, "last-error.txt")
+        with open(target_path, 'w') as f:
+            f.write(contents)
 
-    def get_last_fetched_before_filters(self):
+    def save_xpath_data(self, data, as_error=False):
+        import json
+
+        if as_error:
+            target_path = os.path.join(self.watch_data_dir, "elements-error.json")
+        else:
+            target_path = os.path.join(self.watch_data_dir, "elements.json")
+
+        self.ensure_data_dir_exists()
+
+        with open(target_path, 'w') as f:
+            f.write(json.dumps(data))
+            f.close()
+
+    # Save as PNG, PNG is larger but better for doing visual diff in the future
+    def save_screenshot(self, screenshot: bytes, as_error=False):
+
+        if as_error:
+            target_path = os.path.join(self.watch_data_dir, "last-error-screenshot.png")
+        else:
+            target_path = os.path.join(self.watch_data_dir, "last-screenshot.png")
+
+        self.ensure_data_dir_exists()
+
+        with open(target_path, 'wb') as f:
+            f.write(screenshot)
+            f.close()
+
+
+    def get_last_fetched_text_before_filters(self):
         import brotli
         filepath = os.path.join(self.watch_data_dir, 'last-fetched.br')
 
@@ -536,11 +573,55 @@ class model(dict):
         with open(filepath, 'rb') as f:
             return(brotli.decompress(f.read()).decode('utf-8'))
 
-    def save_last_fetched_before_filters(self, contents):
+    def save_last_text_fetched_before_filters(self, contents):
         import brotli
         filepath = os.path.join(self.watch_data_dir, 'last-fetched.br')
         with open(filepath, 'wb') as f:
             f.write(brotli.compress(contents, mode=brotli.MODE_TEXT))
+
+    def save_last_fetched_html(self, timestamp, contents):
+        import brotli
+
+        self.ensure_data_dir_exists()
+        snapshot_fname = f"{timestamp}.html.br"
+        filepath = os.path.join(self.watch_data_dir, snapshot_fname)
+
+        with open(filepath, 'wb') as f:
+            contents = contents.encode('utf-8') if isinstance(contents, str) else contents
+            try:
+                f.write(brotli.compress(contents))
+            except Exception as e:
+                logger.warning(f"{self.get('uuid')} - Unable to compress snapshot, saving as raw data to {filepath}")
+                logger.warning(e)
+                f.write(contents)
+
+        self._prune_last_fetched_html_snapshots()
+
+    def get_fetched_html(self, timestamp):
+        import brotli
+
+        snapshot_fname = f"{timestamp}.html.br"
+        filepath = os.path.join(self.watch_data_dir, snapshot_fname)
+        if os.path.isfile(filepath):
+            with open(filepath, 'rb') as f:
+                return (brotli.decompress(f.read()).decode('utf-8'))
+
+        return False
+
+
+    def _prune_last_fetched_html_snapshots(self):
+
+        dates = list(self.history.keys())
+        dates.reverse()
+
+        for index, timestamp in enumerate(dates):
+            snapshot_fname = f"{timestamp}.html.br"
+            filepath = os.path.join(self.watch_data_dir, snapshot_fname)
+
+            # Keep only the first 2
+            if index > 1 and os.path.isfile(filepath):
+                os.remove(filepath)
+
 
     @property
     def get_browsersteps_available_screenshots(self):

@@ -1,26 +1,19 @@
 #!/usr/bin/python3
 
-from changedetectionio import queuedWatchMetaData
-from copy import deepcopy
-from distutils.util import strtobool
-from feedgen.feed import FeedGenerator
-from flask_compress import Compress as FlaskCompress
-from flask_login import current_user
-from flask_restful import abort, Api
-from flask_wtf import CSRFProtect
-from functools import wraps
-from threading import Event
 import datetime
-import flask_login
-from loguru import logger
-import sys
 import os
-import pytz
 import queue
 import threading
 import time
+from .safe_jinja import render as jinja_render
+from changedetectionio.strtobool import strtobool
+from copy import deepcopy
+from functools import wraps
+from threading import Event
+import flask_login
+import pytz
 import timeago
-
+from feedgen.feed import FeedGenerator
 from flask import (
     Flask,
     abort,
@@ -35,10 +28,16 @@ from flask import (
 )
 from flask_babel import Babel
 from flask_babel import _
-
+from flask_compress import Compress as FlaskCompress
+from flask_login import current_user
 from flask_paginate import Pagination, get_page_parameter
+from flask_restful import abort, Api
+from flask_cors import CORS
+from flask_wtf import CSRFProtect
+from loguru import logger
 
 from changedetectionio import html_tools, __version__
+from changedetectionio import queuedWatchMetaData
 from changedetectionio.api import api_v1
 
 datastore = None
@@ -63,6 +62,9 @@ def get_locale():
     return request.accept_languages.best_match(['en', 'ko'])
 babel = Babel(app)
 babel.init_app(app, locale_selector=get_locale)
+# Enable CORS, especially useful for the Chrome extension to operate from anywhere
+CORS(app)
+
 # Super handy for compressing large BrowserSteps responses and others
 FlaskCompress(app)
 
@@ -130,10 +132,10 @@ def _jinja2_filter_datetime(watch_obj, format="%Y-%m-%d %H:%M:%S"):
 
 @app.template_filter('format_timestamp_timeago')
 def _jinja2_filter_datetimestamp(timestamp, format="%Y-%m-%d %H:%M:%S"):
-    if timestamp == False:
+    if not timestamp:
         return 'Not yet'
 
-    return timeago.format(timestamp, time.time())
+    return timeago.format(int(timestamp), time.time())
 
 
 @app.template_filter('pagination_slice')
@@ -325,6 +327,7 @@ def changedetection_app(config=None, datastore_o=None):
 
     @app.route("/rss", methods=['GET'])
     def rss():
+        now = time.time()
         # Always requires token set
         app_rss_token = datastore.data['settings']['application'].get('rss_access_token')
         rss_url_token = request.args.get('token')
@@ -343,8 +346,11 @@ def changedetection_app(config=None, datastore_o=None):
 
         # @todo needs a .itemsWithTag() or something - then we can use that in Jinaj2 and throw this away
         for uuid, watch in datastore.data['watching'].items():
+            # @todo tag notification_muted skip also (improve Watch model)
+            if datastore.data['settings']['application'].get('rss_hide_muted_watches') and watch.get('notification_muted'):
+                continue
             if limit_tag and not limit_tag in watch['tags']:
-                    continue
+                continue
             watch['uuid'] = uuid
             sorted_watches.append(watch)
 
@@ -388,8 +394,12 @@ def changedetection_app(config=None, datastore_o=None):
                                              include_equal=False,
                                              line_feed_sep="<br>")
 
-                fe.content(content="<html><body><h4>{}</h4>{}</body></html>".format(watch_title, html_diff),
-                           type='CDATA')
+                # @todo Make this configurable and also consider html-colored markup
+                # @todo User could decide if <link> goes to the diff page, or to the watch link
+                rss_template = "<html><body>\n<h4><a href=\"{{watch_url}}\">{{watch_title}}</a></h4>\n<p>{{html_diff}}</p>\n</body></html>\n"
+                content = jinja_render(template_str=rss_template, watch_title=watch_title, html_diff=html_diff, watch_url=watch.link)
+
+                fe.content(content=content, type='CDATA')
 
                 fe.guid(guid, permalink=False)
                 dt = datetime.datetime.fromtimestamp(int(watch.newest_history_key))
@@ -398,6 +408,7 @@ def changedetection_app(config=None, datastore_o=None):
 
         response = make_response(fg.rss_str())
         response.headers.set('Content-Type', 'application/rss+xml;charset=utf-8')
+        logger.trace(f"RSS generated in {time.time() - now:.3f}s")
         return response
 
     @app.route("/", methods=['GET'])
@@ -406,17 +417,21 @@ def changedetection_app(config=None, datastore_o=None):
         global datastore
         from changedetectionio import forms
 
-        limit_tag = request.args.get('tag', '').lower().strip()
+        active_tag_req = request.args.get('tag', '').lower().strip()
+        active_tag_uuid = active_tag = None
 
         # Be sure limit_tag is a uuid
-        for uuid, tag in datastore.data['settings']['application'].get('tags', {}).items():
-            if limit_tag == tag.get('title', '').lower().strip():
-                limit_tag = uuid
+        if active_tag_req:
+            for uuid, tag in datastore.data['settings']['application'].get('tags', {}).items():
+                if active_tag_req == tag.get('title', '').lower().strip() or active_tag_req == uuid:
+                    active_tag = tag
+                    active_tag_uuid = uuid
+                    break
 
 
         # Redirect for the old rss path which used the /?rss=true
         if request.args.get('rss'):
-            return redirect(url_for('rss', tag=limit_tag))
+            return redirect(url_for('rss', tag=active_tag_uuid))
 
         op = request.args.get('op')
         if op:
@@ -427,7 +442,7 @@ def changedetection_app(config=None, datastore_o=None):
                 datastore.data['watching'][uuid].toggle_mute()
 
             datastore.needs_write = True
-            return redirect(url_for('index', tag = limit_tag))
+            return redirect(url_for('index', tag = active_tag_uuid))
 
         # Sort by last_changed and add the uuid which is usually the key..
         sorted_watches = []
@@ -438,13 +453,15 @@ def changedetection_app(config=None, datastore_o=None):
             if with_errors and not watch.get('last_error'):
                 continue
 
-            if limit_tag and not limit_tag in watch['tags']:
+            if active_tag_uuid and not active_tag_uuid in watch['tags']:
                     continue
             if watch.get('last_error'):
                 errored_count += 1
                 
             if search_q:
                 if (watch.get('title') and search_q in watch.get('title').lower()) or search_q in watch.get('url', '').lower():
+                    sorted_watches.append(watch)
+                elif watch.get('last_error') and search_q in watch.get('last_error').lower():
                     sorted_watches.append(watch)
             else:
                 sorted_watches.append(watch)
@@ -457,12 +474,13 @@ def changedetection_app(config=None, datastore_o=None):
                                 total=total_count,
                                 per_page=datastore.data['settings']['application'].get('pager_size', 50), css_framework="semantic")
 
-
+        sorted_tags = sorted(datastore.data['settings']['application'].get('tags').items(), key=lambda x: x[1]['title'])
         output = render_template(
             "watch-overview.html",
                                  # Don't link to hosting when we're on the hosting environment
-                                 active_tag=limit_tag,
-                                 app_rss_token=datastore.data['settings']['application']['rss_access_token'],
+                                 active_tag=active_tag,
+                                 active_tag_uuid=active_tag_uuid,
+                                 app_rss_token=datastore.data['settings']['application'].get('rss_access_token'),
                                  datastore=datastore,
                                  errored_count=errored_count,
                                  form=form,
@@ -476,7 +494,7 @@ def changedetection_app(config=None, datastore_o=None):
                                  sort_attribute=request.args.get('sort') if request.args.get('sort') else request.cookies.get('sort'),
                                  sort_order=request.args.get('order') if request.args.get('order') else request.cookies.get('order'),
                                  system_default_fetcher=datastore.data['settings']['application'].get('fetch_backend'),
-                                 tags=datastore.data['settings']['application'].get('tags'),
+                                 tags=sorted_tags,
                                  watches=sorted_watches
                                  )
 
@@ -509,21 +527,38 @@ def changedetection_app(config=None, datastore_o=None):
 
         watch = datastore.data['watching'].get(watch_uuid) if watch_uuid else None
 
-        # validate URLS
-        if not len(request.form['notification_urls'].strip()):
-            return make_response({'error': 'No Notification URLs set'}, 400)
+        notification_urls = request.form['notification_urls'].strip().splitlines()
 
-        for server_url in request.form['notification_urls'].splitlines():
-            if len(server_url.strip()):
-                if not apobj.add(server_url):
-                    message = '{} is not a valid AppRise URL.'.format(server_url)
-                    return make_response({'error': message}, 400)
+        if not notification_urls:
+            logger.debug("Test notification - Trying by group/tag in the edit form if available")
+            # On an edit page, we should also fire off to the tags if they have notifications
+            if request.form.get('tags') and request.form['tags'].strip():
+                for k in request.form['tags'].split(','):
+                    tag = datastore.tag_exists_by_name(k.strip())
+                    notification_urls = tag.get('notifications_urls') if tag and tag.get('notifications_urls') else None
+
+        is_global_settings_form = request.args.get('mode', '') == 'global-settings'
+        is_group_settings_form = request.args.get('mode', '') == 'group-settings'
+        if not notification_urls and not is_global_settings_form and not is_group_settings_form:
+            # In the global settings, use only what is typed currently in the text box
+            logger.debug("Test notification - Trying by global system settings notifications")
+            if datastore.data['settings']['application'].get('notification_urls'):
+                notification_urls = datastore.data['settings']['application']['notification_urls']
+
+
+        if not notification_urls:
+            return 'No Notification URLs set/found'
+
+        for n_url in notification_urls:
+            if len(n_url.strip()):
+                if not apobj.add(n_url):
+                    return f'Error - {n_url} is not a valid AppRise URL.'
 
         try:
             # use the same as when it is triggered, but then override it with the form test values
             n_object = {
                 'watch_url': request.form['window_url'],
-                'notification_urls': request.form['notification_urls'].splitlines()
+                'notification_urls': notification_urls
             }
 
             # Only use if present, if not set in n_object it should use the default system value
@@ -542,7 +577,7 @@ def changedetection_app(config=None, datastore_o=None):
         except Exception as e:
             return make_response({'error': str(e)}, 400)
 
-        return 'OK'
+        return 'OK - Sent test notifications'
 
 
     @app.route("/clear_history/<string:uuid>", methods=['GET'])
@@ -579,6 +614,12 @@ def changedetection_app(config=None, datastore_o=None):
         output = render_template("clear_all_history.html")
         return output
 
+    def _watch_has_tag_options_set(watch):
+        """This should be fixed better so that Tag is some proper Model, a tag is just a Watch also"""
+        for tag_uuid, tag in datastore.data['settings']['application'].get('tags', {}).items():
+            if tag_uuid in watch.get('tags', []) and (tag.get('include_filters') or tag.get('subtractive_selectors')):
+                return True
+
     @app.route("/edit/<string:uuid>", methods=['GET', 'POST'])
     @login_optionally_required
     # https://stackoverflow.com/questions/42984453/wtforms-populate-form-with-data-if-data-exists
@@ -589,7 +630,6 @@ def changedetection_app(config=None, datastore_o=None):
         from .blueprint.browser_steps.browser_steps import browser_step_ui_config
         from . import processors
 
-        using_default_check_time = True
         # More for testing, possible to return the first/only
         if not datastore.data['watching'].keys():
             flash("No watches to edit", "error")
@@ -613,10 +653,6 @@ def changedetection_app(config=None, datastore_o=None):
 
         # be sure we update with a copy instead of accidently editing the live object by reference
         default = deepcopy(datastore.data['watching'][uuid])
-
-        # Show system wide default if nothing configured
-        if all(value == 0 or value == None for value in datastore.data['watching'][uuid]['time_between_check'].values()):
-            default['time_between_check'] = deepcopy(datastore.data['settings']['requests']['time_between_check'])
 
         # Defaults for proxy choice
         if datastore.proxy_list is not None:  # When enabled
@@ -651,22 +687,15 @@ def changedetection_app(config=None, datastore_o=None):
 
         if request.method == 'POST' and form.validate():
 
-            extra_update_obj = {}
+            extra_update_obj = {
+                'consecutive_filter_failures': 0,
+                'last_error' : False
+            }
 
             if request.args.get('unpause_on_save'):
                 extra_update_obj['paused'] = False
-            # Re #110, if they submit the same as the default value, set it to None, so we continue to follow the default
-            # Assume we use the default value, unless something relevant is different, then use the form value
-            # values could be None, 0 etc.
-            # Set to None unless the next for: says that something is different
-            extra_update_obj['time_between_check'] = dict.fromkeys(form.time_between_check.data)
-            for k, v in form.time_between_check.data.items():
-                if v and v != datastore.data['settings']['requests']['time_between_check'][k]:
-                    extra_update_obj['time_between_check'] = form.time_between_check.data
-                    using_default_check_time = False
-                    break
 
-
+            extra_update_obj['time_between_check'] = form.time_between_check.data
 
              # Ignore text
             form_ignore_text = form.ignore_text.data
@@ -700,7 +729,7 @@ def changedetection_app(config=None, datastore_o=None):
             datastore.data['watching'][uuid].update(extra_update_obj)
 
             if request.args.get('unpause_on_save'):
-                flash("Updated watch - unpaused!.")
+                flash("Updated watch - unpaused!")
             else:
                 flash("Updated watch.")
 
@@ -747,13 +776,13 @@ def changedetection_app(config=None, datastore_o=None):
                                      extra_title=f" - Edit - {watch.label}",
                                      form=form,
                                      has_default_notification_urls=True if len(datastore.data['settings']['application']['notification_urls']) else False,
-                                     has_empty_checktime=using_default_check_time,
                                      has_extra_headers_file=len(datastore.get_all_headers_in_textfile_for_watch(uuid=uuid)) > 0,
+                                     has_special_tag_options=_watch_has_tag_options_set(watch=watch),
                                      is_html_webdriver=is_html_webdriver,
                                      jq_support=jq_support,
                                      playwright_enabled=os.getenv('PLAYWRIGHT_DRIVER_URL', False),
                                      settings_application=datastore.data['settings']['application'],
-                                     using_global_webdriver_wait=default['webdriver_delay'] is None,
+                                     using_global_webdriver_wait=not default['webdriver_delay'],
                                      uuid=uuid,
                                      visualselector_enabled=visualselector_enabled,
                                      watch=watch
@@ -764,7 +793,7 @@ def changedetection_app(config=None, datastore_o=None):
     @app.route("/settings", methods=['GET', "POST"])
     @login_optionally_required
     def settings_page():
-        from changedetectionio import content_fetcher, forms
+        from changedetectionio import forms
 
         default = deepcopy(datastore.data['settings'])
         if datastore.proxy_list is not None:
@@ -832,11 +861,13 @@ def changedetection_app(config=None, datastore_o=None):
                 flash("An error occurred, please see below.", "error")
 
         output = render_template("settings.html",
-                                 form=form,
-                                 hide_remove_pass=os.getenv("SALTED_PASS", False),
                                  api_key=datastore.data['settings']['application'].get('api_access_token'),
                                  emailprefix=os.getenv('NOTIFICATION_MAIL_BUTTON_PREFIX', False),
-                                 settings_application=datastore.data['settings']['application'])
+                                 form=form,
+                                 hide_remove_pass=os.getenv("SALTED_PASS", False),
+                                 min_system_recheck_seconds=int(os.getenv('MINIMUM_SECONDS_RECHECK_TIME', 3)),
+                                 settings_application=datastore.data['settings']['application']
+                                 )
 
         return output
 
@@ -1046,6 +1077,8 @@ def changedetection_app(config=None, datastore_o=None):
         content = []
         ignored_line_numbers = []
         trigger_line_numbers = []
+        versions = []
+        timestamp = None
 
         # More for testing, possible to return the first/only
         if uuid == 'first':
@@ -1065,57 +1098,53 @@ def changedetection_app(config=None, datastore_o=None):
         if (watch.get('fetch_backend') == 'system' and system_uses_webdriver) or watch.get('fetch_backend') == 'html_webdriver' or watch.get('fetch_backend', '').startswith('extra_browser_'):
             is_html_webdriver = True
 
-        # Never requested successfully, but we detected a fetch error
         if datastore.data['watching'][uuid].history_n == 0 and (watch.get_error_text() or watch.get_error_snapshot()):
             flash("Preview unavailable - No fetch/check completed or triggers not reached", "error")
-            output = render_template("preview.html",
-                                     content=content,
-                                     history_n=watch.history_n,
-                                     extra_stylesheets=extra_stylesheets,
-#                                     current_diff_url=watch['url'],
-                                     watch=watch,
-                                     uuid=uuid,
-                                     is_html_webdriver=is_html_webdriver,
-                                     last_error=watch['last_error'],
-                                     last_error_text=watch.get_error_text(),
-                                     last_error_screenshot=watch.get_error_snapshot())
-            return output
+        else:
+            # So prepare the latest preview or not
+            preferred_version = request.args.get('version')
+            versions = list(watch.history.keys())
+            timestamp = versions[-1]
+            if preferred_version and preferred_version in versions:
+                timestamp = preferred_version
 
-        timestamp = list(watch.history.keys())[-1]
-        try:
-            tmp = watch.get_history_snapshot(timestamp).splitlines()
+            try:
+                versions = list(watch.history.keys())
+                tmp = watch.get_history_snapshot(timestamp).splitlines()
 
-            # Get what needs to be highlighted
-            ignore_rules = watch.get('ignore_text', []) + datastore.data['settings']['application']['global_ignore_text']
+                # Get what needs to be highlighted
+                ignore_rules = watch.get('ignore_text', []) + datastore.data['settings']['application']['global_ignore_text']
 
-            # .readlines will keep the \n, but we will parse it here again, in the future tidy this up
-            ignored_line_numbers = html_tools.strip_ignore_text(content="\n".join(tmp),
-                                                                wordlist=ignore_rules,
-                                                                mode='line numbers'
-                                                                )
+                # .readlines will keep the \n, but we will parse it here again, in the future tidy this up
+                ignored_line_numbers = html_tools.strip_ignore_text(content="\n".join(tmp),
+                                                                    wordlist=ignore_rules,
+                                                                    mode='line numbers'
+                                                                    )
 
-            trigger_line_numbers = html_tools.strip_ignore_text(content="\n".join(tmp),
-                                                                wordlist=watch['trigger_text'],
-                                                                mode='line numbers'
-                                                                )
-            # Prepare the classes and lines used in the template
-            i=0
-            for l in tmp:
-                classes=[]
-                i+=1
-                if i in ignored_line_numbers:
-                    classes.append('ignored')
-                if i in trigger_line_numbers:
-                    classes.append('triggered')
-                content.append({'line': l, 'classes': ' '.join(classes)})
+                trigger_line_numbers = html_tools.strip_ignore_text(content="\n".join(tmp),
+                                                                    wordlist=watch['trigger_text'],
+                                                                    mode='line numbers'
+                                                                    )
+                # Prepare the classes and lines used in the template
+                i=0
+                for l in tmp:
+                    classes=[]
+                    i+=1
+                    if i in ignored_line_numbers:
+                        classes.append('ignored')
+                    if i in trigger_line_numbers:
+                        classes.append('triggered')
+                    content.append({'line': l, 'classes': ' '.join(classes)})
 
-        except Exception as e:
-            content.append({'line': f"File doesnt exist or unable to read timestamp {timestamp}", 'classes': ''})
+            except Exception as e:
+                content.append({'line': f"File doesnt exist or unable to read timestamp {timestamp}", 'classes': ''})
 
         output = render_template("preview.html",
                                  content=content,
+                                 current_version=timestamp,
                                  history_n=watch.history_n,
                                  extra_stylesheets=extra_stylesheets,
+                                 extra_title=f" - Diff - {watch.label} @ {timestamp}",
                                  ignored_line_numbers=ignored_line_numbers,
                                  triggered_line_numbers=trigger_line_numbers,
                                  current_diff_url=watch['url'],
@@ -1125,7 +1154,10 @@ def changedetection_app(config=None, datastore_o=None):
                                  is_html_webdriver=is_html_webdriver,
                                  last_error=watch['last_error'],
                                  last_error_text=watch.get_error_text(),
-                                 last_error_screenshot=watch.get_error_snapshot())
+                                 last_error_screenshot=watch.get_error_snapshot(),
+                                 versions=versions
+                                )
+
 
         return output
 
@@ -1272,9 +1304,8 @@ def changedetection_app(config=None, datastore_o=None):
 
         url = request.form.get('url').strip()
         if datastore.url_exists(url):
-            flash('The URL {} already exists'.format(url), "error")
-            return redirect(url_for('index'))
-
+            flash(f'Warning, URL {url} already exists', "notice")
+            
         add_paused = request.form.get('edit_and_watch_submit_button') != None
         processor = request.form.get('processor', 'text_json_diff')
         new_uuid = datastore.add_watch(url=url, tag=request.form.get('tags').strip(), extras={'paused': add_paused, 'processor': processor})
@@ -1423,6 +1454,13 @@ def changedetection_app(config=None, datastore_o=None):
                     # Recheck and require a full reprocessing
                     update_q.put(queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid, 'skip_when_checksum_same': False}))
             flash("{} watches queued for rechecking".format(len(uuids)))
+
+        elif (op == 'clear-errors'):
+            for uuid in uuids:
+                uuid = uuid.strip()
+                if datastore.data['watching'].get(uuid):
+                    datastore.data['watching'][uuid]["last_error"] = False
+            flash(f"{len(uuids)} watches errors cleared")
 
         elif (op == 'clear-history'):
             for uuid in uuids:
@@ -1631,14 +1669,14 @@ def notification_runner():
             # Trim the log length
             notification_debug_log = notification_debug_log[-100:]
 
-# Thread runner to check every minute, look for new watches to feed into the Queue.
+# Threaded runner, look for new watches to feed into the Queue.
 def ticker_thread_check_time_launch_checks():
     import random
     from changedetectionio import update_worker
 
     proxy_last_called_time = {}
 
-    recheck_time_minimum_seconds = int(os.getenv('MINIMUM_SECONDS_RECHECK_TIME', 20))
+    recheck_time_minimum_seconds = int(os.getenv('MINIMUM_SECONDS_RECHECK_TIME', 3))
     logger.debug(f"System env MINIMUM_SECONDS_RECHECK_TIME {recheck_time_minimum_seconds}")
 
     # Spin up Workers that do the fetching
@@ -1692,9 +1730,7 @@ def ticker_thread_check_time_launch_checks():
                 continue
 
             # If they supplied an individual entry minutes to threshold.
-
-            watch_threshold_seconds = watch.threshold_seconds()
-            threshold = watch_threshold_seconds if watch_threshold_seconds > 0 else recheck_time_system_seconds
+            threshold = recheck_time_system_seconds if watch.get('time_between_check_use_default') else watch.threshold_seconds()
 
             # #580 - Jitter plus/minus amount of time to make the check seem more random to the server
             jitter = datastore.data['settings']['requests'].get('jitter_seconds', 0)

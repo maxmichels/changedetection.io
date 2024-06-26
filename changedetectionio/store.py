@@ -1,4 +1,4 @@
-from distutils.util import strtobool
+from changedetectionio.strtobool import strtobool
 
 from flask import (
     flash
@@ -124,12 +124,12 @@ class ChangeDetectionStore:
                 self.__data['app_guid'] = str(uuid_builder.uuid4())
 
         # Generate the URL access token for RSS feeds
-        if not 'rss_access_token' in self.__data['settings']['application']:
+        if not self.__data['settings']['application'].get('rss_access_token'):
             secret = secrets.token_hex(16)
             self.__data['settings']['application']['rss_access_token'] = secret
 
         # Generate the API access token
-        if not 'api_access_token' in self.__data['settings']['application']:
+        if not self.__data['settings']['application'].get('api_access_token'):
             secret = secrets.token_hex(16)
             self.__data['settings']['application']['api_access_token'] = secret
 
@@ -163,7 +163,6 @@ class ChangeDetectionStore:
                         del (update_obj[dict_key])
 
             self.__data['watching'][uuid].update(update_obj)
-
         self.needs_write = True
 
     @property
@@ -178,7 +177,7 @@ class ChangeDetectionStore:
     @property
     def has_unviewed(self):
         for uuid, watch in self.__data['watching'].items():
-            if watch.viewed == False:
+            if watch.history_n >= 2 and watch.viewed == False:
                 return True
         return False
 
@@ -255,6 +254,7 @@ class ChangeDetectionStore:
                 'last_viewed': 0,
                 'previous_md5': False,
                 'previous_md5_before_filters': False,
+                'remote_server_reply': None,
                 'track_ldjson_price_data': None,
             })
 
@@ -374,46 +374,6 @@ class ChangeDetectionStore:
             return True
 
         return False
-
-    # Save as PNG, PNG is larger but better for doing visual diff in the future
-    def save_screenshot(self, watch_uuid, screenshot: bytes, as_error=False):
-        if not self.data['watching'].get(watch_uuid):
-            return
-
-        if as_error:
-            target_path = os.path.join(self.datastore_path, watch_uuid, "last-error-screenshot.png")
-        else:
-            target_path = os.path.join(self.datastore_path, watch_uuid, "last-screenshot.png")
-
-        self.data['watching'][watch_uuid].ensure_data_dir_exists()
-
-        with open(target_path, 'wb') as f:
-            f.write(screenshot)
-            f.close()
-
-
-    def save_error_text(self, watch_uuid, contents):
-        if not self.data['watching'].get(watch_uuid):
-            return
-
-        self.data['watching'][watch_uuid].ensure_data_dir_exists()
-        target_path = os.path.join(self.datastore_path, watch_uuid, "last-error.txt")
-        with open(target_path, 'w') as f:
-            f.write(contents)
-
-    def save_xpath_data(self, watch_uuid, data, as_error=False):
-
-        if not self.data['watching'].get(watch_uuid):
-            return
-        if as_error:
-            target_path = os.path.join(self.datastore_path, watch_uuid, "elements-error.json")
-        else:
-            target_path = os.path.join(self.datastore_path, watch_uuid, "elements.json")
-        self.data['watching'][watch_uuid].ensure_data_dir_exists()
-        with open(target_path, 'w') as f:
-            f.write(json.dumps(data))
-            f.close()
-
 
     def sync_to_json(self):
         logger.info("Saving JSON..")
@@ -553,7 +513,6 @@ class ChangeDetectionStore:
         return os.path.isfile(filepath)
 
     def get_all_base_headers(self):
-        from .model.App import parse_headers_from_text_file
         headers = {}
         # Global app settings
         headers.update(self.data['settings'].get('headers', {}))
@@ -656,7 +615,10 @@ class ChangeDetectionStore:
         return res
 
     def tag_exists_by_name(self, tag_name):
-        return any(v.get('title', '').lower() == tag_name.lower() for k, v in self.__data['settings']['application']['tags'].items())
+        # Check if any tag dictionary has a 'title' attribute matching the provided tag_name
+        tags = self.__data['settings']['application']['tags'].values()
+        return next((v for v in tags if v.get('title', '').lower() == tag_name.lower()),
+                    None)
 
     def get_updates_available(self):
         import inspect
@@ -868,3 +830,16 @@ class ChangeDetectionStore:
                         self.__data["watching"][awatch]['include_filters'][num] = 'xpath1:' + selector
                     if selector.startswith('xpath:'):
                         self.__data["watching"][awatch]['include_filters'][num] = selector.replace('xpath:', 'xpath1:', 1)
+
+    # Use more obvious default time setting
+    def update_15(self):
+        for uuid in self.__data["watching"]:
+            if self.__data["watching"][uuid]['time_between_check'] == self.__data['settings']['requests']['time_between_check']:
+                # What the old logic was, which was pretty confusing
+                self.__data["watching"][uuid]['time_between_check_use_default'] = True
+            elif all(value is None or value == 0 for value in self.__data["watching"][uuid]['time_between_check'].values()):
+                self.__data["watching"][uuid]['time_between_check_use_default'] = True
+            else:
+                # Something custom here
+                self.__data["watching"][uuid]['time_between_check_use_default'] = False
+

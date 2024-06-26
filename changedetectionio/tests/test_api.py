@@ -149,6 +149,15 @@ def test_api_simple(client, live_server):
         headers={'x-api-key': api_key},
     )
     assert b'which has this one new line' in res.data
+    assert b'<div id' not in res.data
+
+    # Fetch the HTML of the latest one
+    res = client.get(
+        url_for("watchsinglehistory", uuid=watch_uuid, timestamp='latest')+"?html=1",
+        headers={'x-api-key': api_key},
+    )
+    assert b'which has this one new line' in res.data
+    assert b'<div id' in res.data
 
     # Fetch the whole watch
     res = client.get(
@@ -163,6 +172,7 @@ def test_api_simple(client, live_server):
     # Loading the most recent snapshot should force viewed to become true
     client.get(url_for("diff_history_page", uuid="first"), follow_redirects=True)
 
+    time.sleep(3)
     # Fetch the whole watch again, viewed should be true
     res = client.get(
         url_for("watch", uuid=watch_uuid),
