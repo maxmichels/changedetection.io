@@ -26,6 +26,8 @@ from flask import (
     session,
     url_for,
 )
+from flask_babel import Babel
+from flask_babel import _
 from flask_compress import Compress as FlaskCompress
 from flask_login import current_user
 from flask_paginate import Pagination, get_page_parameter
@@ -54,6 +56,12 @@ app = Flask(__name__,
             static_folder="static",
             template_folder="templates")
 
+def get_locale():
+    # Debug i8n with simple trick
+    #return 'ko'
+    return request.accept_languages.best_match(['en', 'ko'])
+babel = Babel(app)
+babel.init_app(app, locale_selector=get_locale)
 # Enable CORS, especially useful for the Chrome extension to operate from anywhere
 CORS(app)
 
